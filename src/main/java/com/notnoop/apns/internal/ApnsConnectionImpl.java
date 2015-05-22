@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.SocketFactory;
 import javax.net.ssl.SSLSocketFactory;
 import com.notnoop.apns.ApnsDelegate;
+import com.notnoop.apns.StartSendingApnsDelegate;
 import com.notnoop.apns.ApnsNotification;
 import com.notnoop.apns.DeliveryError;
 import com.notnoop.apns.EnhancedApnsNotification;
@@ -209,8 +210,6 @@ public class ApnsConnectionImpl implements ApnsConnection {
                         }
                         logger.debug("resending {} notifications", resendSize);
                         delegate.notificationsResent(resendSize);
-
-                        drainBuffer();
                     }
                     logger.debug("Monitoring input stream closed by EOF");
 
@@ -222,6 +221,7 @@ public class ApnsConnectionImpl implements ApnsConnection {
                     delegate.connectionClosed(DeliveryError.UNKNOWN, -1);
                 } finally {
                     close();
+                    drainBuffer();
                 }
             }
 
@@ -255,7 +255,7 @@ public class ApnsConnectionImpl implements ApnsConnection {
         t.start();
     }
 
-    private synchronized Socket getOrCreateSocket() throws NetworkIOException {
+    private synchronized Socket getOrCreateSocket(boolean resend) throws NetworkIOException {
         if (reconnectPolicy.shouldReconnect()) {
             logger.debug("Reconnecting due to reconnectPolicy dictating it");
             Utilities.close(socket);
@@ -298,7 +298,8 @@ public class ApnsConnectionImpl implements ApnsConnection {
                 logger.debug("Made a new connection to APNS");
             } catch (IOException e) {
                 logger.error("Couldn't connect to APNS server", e);
-                throw new NetworkIOException(e);
+                // indicate to clients whether this is a resend or initial send
+                throw new NetworkIOException(e, resend);
             }
         }
         return socket;
@@ -315,11 +316,15 @@ public class ApnsConnectionImpl implements ApnsConnection {
     private synchronized void sendMessage(ApnsNotification m, boolean fromBuffer) throws NetworkIOException {
         logger.debug("sendMessage {} fromBuffer: {}", m, fromBuffer);
 
+        if (delegate instanceof StartSendingApnsDelegate) {
+            ((StartSendingApnsDelegate) delegate).startSending(m, fromBuffer);
+        }
+
         int attempts = 0;
         while (true) {
             try {
                 attempts++;
-                Socket socket = getOrCreateSocket();
+                Socket socket = getOrCreateSocket(fromBuffer);
                 socket.getOutputStream().write(m.marshall());
                 socket.getOutputStream().flush();
                 cacheNotification(m);
@@ -353,7 +358,15 @@ public class ApnsConnectionImpl implements ApnsConnection {
     private synchronized void drainBuffer() {
         logger.debug("draining buffer");
         while (!notificationsBuffer.isEmpty()) {
-            sendMessage(notificationsBuffer.poll(), true);
+            final ApnsNotification notification = notificationsBuffer.poll();
+            try {
+                sendMessage(notification, true);
+            }
+            catch (NetworkIOException ex) {
+                // at this point we are retrying the submission of messages but failing to connect to APNS, therefore
+                // notify the client of this
+                delegate.messageSendFailed(notification, ex);
+            }
         }
     }
 
